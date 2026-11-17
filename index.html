@@ -34,7 +34,13 @@
   input { width: 100%; padding: 12px; font-size: 16px; border: 1.5px solid var(--line);
           border-radius: 10px; background: #fff; }
   label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-  #result { display: none; border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; }
+  #result { display: none; position: fixed; left: 8px; right: 8px; top: calc(8px + env(safe-area-inset-top));
+            z-index: 50; max-width: 520px; margin: 0 auto; border-radius: 14px; padding: 14px 16px;
+            box-shadow: 0 6px 24px rgba(0,0,0,.25); }
+  #result.ok, #result.warn, #result.err, #result.info { border: 3px solid currentColor; }
+  #result.info { display: block; background: #eef1f5; color: var(--muted); }
+  #reader { border: 4px solid transparent; transition: border-color .15s; }
+  #reader.f-ok { border-color: var(--ok); } #reader.f-warn { border-color: #e0a100; } #reader.f-err { border-color: var(--err); }
   #result.ok   { display: block; background: var(--ok-bg);   color: var(--ok);   }
   #result.warn { display: block; background: var(--warn-bg); color: var(--warn); }
   #result.err  { display: block; background: var(--err-bg);  color: var(--err);  }
@@ -118,7 +124,9 @@
   var DEFAULT_URL = '';
 
   var QR_RE = /^\s*(\d{4,12})\s+([A-Za-z0-9]{2,20})\s*$/;
-  var COOLDOWN_MS = 4000;     // to pašu kodu atkārtoti neapstrādā 4 sekundes
+  var SAME_CODE_GAP_MS = 3000; // to pašu kodu, kamēr tas ir kamerā, neapstrādā; jāpatur prom ≥3 s
+  var RESULT_HIDE_MS = 5000;   // rezultāta josla pazūd pēc 5 s
+  var sessionCodes = {};       // šajā telefonā šajā sesijā jau saglabātie kodi
   var LS = { url: 'qr_url', pin: 'qr_pin', user: 'qr_user', queue: 'qr_queue' };
 
   var $ = function (id) { return document.getElementById(id); };
@@ -137,22 +145,51 @@
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 
   // ---------- Atgriezeniskā saite ----------
-  function feedback(kind) {
+  // Skaņa: AudioContext tiek sagatavots jau pie pirmās pogas nospiešanas, lai signāls skan uzreiz
+  var audioCtx = null;
+  function unlockAudio() {
     try {
-      if (navigator.vibrate) navigator.vibrate(kind === 'ok' ? 80 : [60, 60, 60]);
       var Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
-      feedback.ctx = feedback.ctx || new Ctx();
-      var ctx = feedback.ctx, o = ctx.createOscillator(), g = ctx.createGain();
-      o.frequency.value = kind === 'ok' ? 1046 : 330;
-      g.gain.value = 0.15; o.connect(g); g.connect(ctx.destination);
-      o.start(); o.stop(ctx.currentTime + (kind === 'ok' ? 0.12 : 0.3));
+      audioCtx = audioCtx || new Ctx();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var b = audioCtx.createBuffer(1, 1, 22050), src = audioCtx.createBufferSource();
+      src.buffer = b; src.connect(audioCtx.destination); src.start(0);
+    } catch (e) {}
+  }
+  document.addEventListener('click', unlockAudio, true);
+  document.addEventListener('touchstart', unlockAudio, true);
+
+  function tone(freq, dur, delay) {
+    if (!audioCtx) return;
+    try {
+      var t = audioCtx.currentTime + (delay || 0);
+      var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = freq; g.gain.value = 0.18;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t); o.stop(t + dur);
+    } catch (e) {}
+  }
+  // 'scan' — uzreiz, kad QR atpazīts; 'warn'/'err' — pēc tabulas atbildes
+  function feedback(kind) {
+    try {
+      if (kind === 'scan') { if (navigator.vibrate) navigator.vibrate(60); tone(1175, 0.09); }
+      else if (kind === 'warn') { if (navigator.vibrate) navigator.vibrate([150, 80, 150]); tone(440, 0.15); tone(330, 0.25, 0.18); }
+      else if (kind === 'err') { if (navigator.vibrate) navigator.vibrate([300, 100, 300]); tone(260, 0.4); }
     } catch (e) {}
   }
 
+  var hideTimer = null;
   function showResult(cls, title, detail, code) {
     var r = $('result');
     r.className = cls;
+    var rd = $('reader');
+    rd.classList.remove('f-ok', 'f-warn', 'f-err');
+    if (cls !== 'info') rd.classList.add('f-' + cls);
+    clearTimeout(hideTimer);
+    if (cls !== 'info') hideTimer = setTimeout(function () {
+      r.className = ''; rd.classList.remove('f-ok', 'f-warn', 'f-err');
+    }, RESULT_HIDE_MS);
     r.innerHTML = '<div class="t">' + esc(title) + '</div>' +
       (detail ? '<div class="d">' + esc(detail) + '</div>' : '') +
       (code ? '<div class="c">' + esc(code) + '</div>' : '');
@@ -181,10 +218,15 @@
   function handleText(text, source) {
     text = String(text || '').trim();
     var now = Date.now();
-    if (source === 'camera' && text === lastText && now - lastTime < COOLDOWN_MS) return;
-    lastText = text; lastTime = now;
+    if (source === 'camera') {
+      // Kamēr tas pats kods ir kamerā, laiks tiek atjaunots — atkārtots skenējums nenotiek
+      var same = text === lastText && now - lastTime < SAME_CODE_GAP_MS;
+      lastText = text; lastTime = now;
+      if (same) return;
+    }
 
     var m = text.match(QR_RE);
+    feedback('scan');                       // signāls uzreiz pēc atpazīšanas
     if (!m) {
       feedback('err');
       showResult('err', 'Nederīgs QR kods', 'Gaidīts: iestādes kods un pārbaudījuma kods', text);
@@ -193,11 +235,16 @@
     }
     var item = { qr: m[1] + ' ' + m[2].toUpperCase(), source: source,
                  scannedAt: new Date().toISOString() };
+    if (sessionCodes[item.qr]) {            // jau skenēts šajā telefonā — tabulai nesūta
+      feedback('warn');
+      showResult('warn', '⚠ Jūs šo darbu jau skenējāt', sessionCodes[item.qr], item.qr);
+      return;
+    }
     send(item, true);
   }
 
   function send(item, interactive) {
-    if (interactive) showResult('warn', 'Sūta…', '', item.qr);
+    if (interactive) showResult('info', 'Sūta…', '', item.qr);
     return post({ action: 'scan', qr: item.qr, source: item.source, scannedAt: item.scannedAt })
       .then(function (res) {
         if (res.status === 'busy') throw new Error('busy');   // tabula aizņemta → rindā
@@ -206,11 +253,12 @@
           .filter(Boolean).join(' — ');
         if (res.status === 'saved') {
           savedCount++; $('cntSaved').textContent = savedCount;
-          feedback('ok');
+          sessionCodes[item.qr] = who;
           showResult('ok', '✓ ' + res.message, who, item.qr);
           addLog('saved', res.schoolName || res.schoolCode, res.examCode);
         } else if (res.status === 'duplicate') {
-          feedback('err');
+          sessionCodes[item.qr] = who + '. ' + res.message;
+          feedback('warn');
           showResult('warn', '⚠ Šis darbs jau ir reģistrēts', who + '. ' + res.message, item.qr);
           addLog('duplicate', (res.schoolName || res.schoolCode) + ' (atkārtots)', res.examCode);
         } else if (res.status === 'auth') {
@@ -228,7 +276,7 @@
       .catch(function () {
         if (!interactive) throw new Error('offline');
         var q = getQueue(); q.push(item); setQueue(q);
-        feedback('ok');
+        sessionCodes[item.qr] = 'Gaida nosūtīšanu';
         showResult('warn', 'Nav savienojuma vai tabula aizņemta — saglabāts rindā',
           'Tiks nosūtīts automātiski, kad būs internets', item.qr);
         addLog('queued', item.qr, 'gaida nosūtīšanu');
@@ -260,14 +308,12 @@
     scanner = scanner || new Html5Qrcode('reader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE] });
     scanner.start({ facingMode: 'environment' },
       { fps: 10, qrbox: function (w, h) { var s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
-      function (text) {
-        if (busy) return;
-        busy = true;
-        handleText(text, 'camera');
-        setTimeout(function () { busy = false; }, 1500);
-      },
+      function (text) { handleText(text, 'camera'); },
       function () {})
-      .then(function () { scanning = true; $('btnCam').textContent = 'Apturēt skenēšanu'; })
+      .then(function () {
+        scanning = true; $('btnCam').textContent = 'Apturēt skenēšanu';
+        $('reader').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      })
       .catch(function (err) {
         showResult('err', 'Kamera nav pieejama',
           'Atļaujiet kameras piekļuvi pārlūkā vai izmantojiet «Skenēt no foto». ' + (err && err.message ? err.message : err), '');
